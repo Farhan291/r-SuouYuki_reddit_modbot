@@ -1,6 +1,3 @@
-#from dotenv import load_dotenv
-#load_dotenv()
-
 import os
 import praw
 import time
@@ -19,8 +16,7 @@ reddit = praw.Reddit(
 
 sauce = os.environ["SAUCENAO_API_KEY"]
 subreddit = reddit.subreddit("SuouYuki")
-print("working")
-ai_posts ={}
+ai_posts = {}
 
 app = Flask(__name__)
 
@@ -33,6 +29,7 @@ def run_bot():
     for submission in subreddit.stream.submissions(skip_existing=True):
         try:
             url = str(submission.url)
+            
             try:
                 params = {"api_key": sauce, "url": url, "output_type": 2}
                 response = requests.get("https://saucenao.com/search.php", params=params, timeout=15)
@@ -49,7 +46,7 @@ def run_bot():
                         comment.mod.distinguish(sticky=True)
             except Exception as e:
                 print(f"SauceNAO error: {e}")
-            
+
             if submission.link_flair_text == "AI":
                 author = str(submission.author)
                 now = datetime.utcnow()
@@ -79,7 +76,6 @@ def run_bot():
             print(f"General error: {e}")
             time.sleep(30)
 
-if __name__ == "__main__":
-    bot_thread = Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+bot_thread = Thread(target=run_bot, daemon=True)
+bot_thread.start()
+print("Bot thread started, Flask app ready.")
