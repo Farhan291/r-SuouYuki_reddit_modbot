@@ -48,6 +48,7 @@ def run_bot():
                             "*I am bot and this action was performed automatically*"
                         )
                         comment.mod.distinguish(sticky=True)
+                        comment.mod.approve()
             except Exception as e:
                 print(f"SauceNAO error: {e}")
 
@@ -58,12 +59,13 @@ def run_bot():
                 key = f"ai_post:{author}"
                 if r.exists(key):
                     comment = submission.reply(
-                        f"Hi {author}, your post has been removed because you exceeded the AI image post limit (1 per week).\n\n"
+                        f"Hi u/{author}, your post has been removed because you exceeded the AI image post limit (1 per week).\n\n"
                         "Please wait for the cooldown of one week before posting another AI image.\n\n"
                         "Contact moderators if you think this was an error.\n\n"
                         "*I am bot and this action was performed automatically*"
                     )
                     comment.mod.distinguish(sticky=True)
+                    comment.mod.approve()
                     time.sleep(10)
                     submission.mod.remove()
                 else:
