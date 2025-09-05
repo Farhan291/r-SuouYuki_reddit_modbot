@@ -1,6 +1,7 @@
 import os
 import praw
 import time
+import redis 
 from datetime import datetime, timedelta
 import requests
 from threading import Thread
@@ -14,9 +15,12 @@ reddit = praw.Reddit(
     user_agent=os.environ["REDDIT_USER_AGENT"]
 )
 
+redis_url=os.environ["REDIS_URL"]
+r = redis.from_url(redis_url, decode_responses=True)
+
 sauce = os.environ["SAUCENAO_API_KEY"]
 subreddit = reddit.subreddit("SuouYuki")
-ai_posts = {}
+#ai_posts = {}
 
 app = Flask(__name__)
 
@@ -25,7 +29,7 @@ def home():
     return "Bot is running!"
 
 def run_bot():
-    global ai_posts
+    #global ai_posts
     for submission in subreddit.stream.submissions(skip_existing=True):
         try:
             url = str(submission.url)
@@ -49,12 +53,10 @@ def run_bot():
 
             if submission.link_flair_text == "AI":
                 author = str(submission.author)
-                now = datetime.utcnow()
-                one_week_ago = now - timedelta(weeks=1)
-                ai_posts = {k: v for k, v in ai_posts.items() if v >= one_week_ago}
                 post_time = datetime.utcfromtimestamp(submission.created_utc)
-
-                if author in ai_posts:
+                
+                key = f"ai_post:{author}"
+                if r.exists(key):
                     comment = submission.reply(
                         f"Hi {author}, your post has been removed because you exceeded the AI image post limit (1 per week).\n\n"
                         "Please wait for the cooldown of one week before posting another AI image.\n\n"
@@ -65,9 +67,9 @@ def run_bot():
                     time.sleep(10)
                     submission.mod.remove()
                 else:
-                    ai_posts[author] = post_time
+                    r.setex(key, timedelta(weeks=1), post_time.isoformat())
                     comment = submission.reply(
-                        f"Hi {author}, this is your first AI image post this week. "
+                        f"Hi u/{author}, this is your first AI image post this week. "
                         "Please remember you cannot post another AI image until one week cooldown."
                     )
                     comment.mod.distinguish(sticky=True)
@@ -75,7 +77,9 @@ def run_bot():
         except Exception as e:
             print(f"General error: {e}")
             time.sleep(30)
+            
 
 bot_thread = Thread(target=run_bot, daemon=True)
 bot_thread.start()
+
 print("Bot thread started, Flask app ready.")

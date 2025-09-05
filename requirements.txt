@@ -2,3 +2,4 @@ praw
 flask
 requests
 gunicorn
+redis
