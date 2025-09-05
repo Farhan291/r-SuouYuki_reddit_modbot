@@ -28,6 +28,7 @@ This is my custom Reddit moderation bot for my subreddit r/SuouYuki. It handles 
 - Python with [PRAW](https://praw.readthedocs.io/) (Reddit API)
 - Flask for health checks
 - SauceNAO API for reverse image search
+- Redis as primary db for cooldown tracking
 
 ## Setup
 
@@ -45,9 +46,11 @@ This is my custom Reddit moderation bot for my subreddit r/SuouYuki. It handles 
 
         SAUCENAO_API_KEY
 
+        REDIS_URL
+
 ### Install requirements
 
-`pip install praw flask requests gunicorn`
+`pip install praw flask requests gunicorn redis`
 
 ### Run
 
