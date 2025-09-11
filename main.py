@@ -73,6 +73,7 @@ def run_bot():
                     comment = submission.reply(
                         f"Hi u/{author}, this is your first AI image post this week. "
                         "Please remember you cannot post another AI image until one week cooldown."
+                        "*I am bot and this action was performed automatically.*"
                     )
                     comment.mod.distinguish(sticky=True)
 
