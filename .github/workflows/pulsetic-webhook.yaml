@@ -1,0 +1,12 @@
+name: redeploy-on-up
+
+on:
+  repository_dispatch:
+    types: [site-up]
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: trigger render deploy
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
