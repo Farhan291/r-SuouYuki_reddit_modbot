@@ -2,7 +2,7 @@ name: redeploy-on-up
 
 on:
   repository_dispatch:
-    types: [site-up]
+    types: [site-down]
 
 jobs:
   redeploy:
