@@ -292,6 +292,15 @@ class RedditBot:
 app = Flask(__name__)
 bot: Optional[RedditBot] = None
 
+# Initialize bot on module load (for Gunicorn)
+try:
+    bot = RedditBot()
+    logger.info("Bot initialized successfully")
+    bot_thread = Thread(target=bot.run, daemon=True)
+    bot_thread.start()
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {e}")
+
 
 @app.route("/")
 def home():
