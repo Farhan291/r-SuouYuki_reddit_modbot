@@ -1,59 +1,43 @@
-# r/SuouYuki Mod Bot
+# Reddit Mod Bot
 
-This is my custom Reddit moderation bot for my subreddit r/SuouYuki. It handles two main tasks automatically:
+A simple Reddit moderation bot for r/SuouYuki.
 
 ## What It Does
 
-### Reverse Image Search
-
-- Automatically checks every image post
-
-- Uses SauceNAO API to find the original source
-
-- Posts the source link as a sticky comment
-
-### AI Post Limit Enforcement
-
-- Limits users to 1 AI-flaired post per week
-
-- Automatically removes posts that exceed the limit
-
-- Explains removal reasons with sticky comments
-
-- Tracks user post history for cooldowns
-
-### Preview
-![ss](image.png)
-## Tech Stack
-- Python with [PRAW](https://praw.readthedocs.io/) (Reddit API)
-- Flask for health checks
-- SauceNAO API for reverse image search
-- Redis as primary db for cooldown tracking
+- **Image source lookup**: Uses SauceNAO API to find sources for image posts
+- **AI post limit**: Limits AI-flaired posts to 1 per week
+- **Health/stats API**: HTTP endpoints for monitoring
 
 ## Setup
 
-    Add these environment variables:
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-        REDDIT_CLIENT_ID
+# Create .env file (copy from .env.example)
+cp .env.example .env
 
-        REDDIT_CLIENT_SECRET
+# Run the bot
+python main.py
+```
 
-        REDDIT_USERNAME
+Or with Docker:
 
-        REDDIT_PASSWORD
+```bash
+docker compose up --build -d
+```
 
-        REDDIT_USER_AGENT
+## Environment Variables
 
-        SAUCENAO_API_KEY
+- `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USERNAME`, `REDDIT_PASSWORD`, `REDDIT_USER_AGENT`
+- `REDDIT_SUBREDDIT` - subreddit to moderate (default: SuouYuki)
+- `SAUCENAO_API_KEY` - SauceNAO API key
+- `REDIS_URL` - Redis URL (e.g., redis://localhost:6379)
+- `PORT` - HTTP server port (default: 8080)
 
-        REDIS_URL
+## API Endpoints
 
-### Install requirements
-
-`pip install praw flask requests gunicorn redis`
-
-### Run
-
-`python main.py`
-
-
+- `GET /` - Health check
+- `GET /health` - Detailed health status
+- `GET /stats` - Bot statistics
+- `POST /reload` - Reload the bot
