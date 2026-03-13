@@ -5,9 +5,8 @@ import time
 from dotenv import load_dotenv
 import redis
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
-from contextlib import contextmanager
 import requests
 from threading import Thread, Lock
 from flask import Flask, jsonify
@@ -21,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env if present
 load_dotenv()
+
+# Maximum age (in seconds) of a submission to process.
+# Posts older than this are silently skipped. Prevents the bot from
+# acting on year-old posts that PRAW may return after a stream reconnect.
+MAX_SUBMISSION_AGE_SECONDS = int(
+    os.environ.get("MAX_SUBMISSION_AGE_SECONDS", "600")
+)  # 10 minutes
 
 
 class RedisManager:
@@ -55,7 +61,7 @@ class RedisManager:
             if self._client:
                 try:
                     self._client.close()
-                except:
+                except Exception:
                     pass
             self._client = None
 
@@ -70,30 +76,50 @@ class RedisManager:
         logger.error("Redis reconnection failed after all attempts")
         return False
 
-    @contextmanager
-    def safe_operation(self):
+    def _execute(self, operation):
+        """Execute a Redis operation with automatic reconnect on failure."""
         try:
-            yield self._client
-        except redis.ConnectionError as e:
-            logger.error(f"Redis connection error: {e}")
+            if self._client is None:
+                if not self.reconnect():
+                    return None
+            return operation(self._client)
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.error(f"Redis error: {e}")
             if self.reconnect():
-                yield self._client
-            else:
-                raise
-        except redis.TimeoutError as e:
-            logger.error(f"Redis timeout error: {e}")
-            if self.reconnect():
-                yield self._client
-            else:
-                raise
+                try:
+                    return operation(self._client)
+                except Exception as e2:
+                    logger.error(f"Redis retry failed: {e2}")
+                    return None
+            return None
 
     def exists(self, key: str) -> bool:
-        with self.safe_operation() as r:
-            return bool(r.exists(key)) if r else False
+        result = self._execute(lambda r: r.exists(key))
+        return bool(result) if result is not None else False
 
-    def setex(self, key: str, time: int, value: str) -> bool:
-        with self.safe_operation() as r:
-            return bool(r.setex(key, time, value)) if r else False
+    def setex(self, key: str, ttl: int, value: str) -> bool:
+        result = self._execute(lambda r: r.setex(key, ttl, value))
+        return bool(result) if result is not None else False
+
+    def setnx(self, key: str, value: str) -> bool:
+        """Set key only if it does NOT already exist (atomic). Returns True if set."""
+        result = self._execute(lambda r: r.setnx(key, value))
+        return bool(result) if result is not None else False
+
+    def expire(self, key: str, ttl: int) -> bool:
+        """Set TTL on an existing key."""
+        result = self._execute(lambda r: r.expire(key, ttl))
+        return bool(result) if result is not None else False
+
+    def sadd(self, key: str, value: str) -> bool:
+        """Add a member to a set."""
+        result = self._execute(lambda r: r.sadd(key, value))
+        return bool(result) if result is not None else False
+
+    def sismember(self, key: str, value: str) -> bool:
+        """Check if a value is a member of a set."""
+        result = self._execute(lambda r: r.sismember(key, value))
+        return bool(result) if result is not None else False
 
     def get_client(self) -> Optional[redis.Redis]:
         return self._client
@@ -135,9 +161,45 @@ class RedditBot:
             "ai_posts_processed": 0,
             "posts_removed": 0,
             "sources_found": 0,
+            "skipped_old": 0,
+            "skipped_duplicate": 0,
             "errors": 0,
             "start_time": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _is_submission_too_old(self, submission) -> bool:
+        """Check if a submission is older than MAX_SUBMISSION_AGE_SECONDS.
+        Prevents the bot from processing old posts that PRAW may serve
+        after a stream reconnect or on startup."""
+        try:
+            created_utc = submission.created_utc
+            now_utc = datetime.now(timezone.utc).timestamp()
+            age_seconds = now_utc - created_utc
+            if age_seconds > MAX_SUBMISSION_AGE_SECONDS:
+                logger.info(
+                    f"Skipping old submission {submission.id} "
+                    f"(age: {age_seconds:.0f}s, max: {MAX_SUBMISSION_AGE_SECONDS}s)"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking submission age: {e}")
+            # If we can't determine age, process it to be safe
+            return False
+
+    def _is_already_processed(self, submission) -> bool:
+        """Check if this submission was already processed using a Redis set.
+        Prevents duplicate processing when the stream serves the same post
+        multiple times (e.g. after reconnects)."""
+        key = "processed_submissions"
+        if self.redis_mgr.sismember(key, submission.id):
+            logger.debug(f"Skipping already-processed submission {submission.id}")
+            return True
+        return False
+
+    def _mark_processed(self, submission):
+        """Mark a submission as processed in Redis."""
+        self.redis_mgr.sadd("processed_submissions", submission.id)
 
     def search_source(self, url: str) -> Optional[str]:
         try:
@@ -192,9 +254,32 @@ class RedditBot:
     def process_ai_post(self, submission) -> bool:
         author = str(submission.author)
         key = f"ai_post:{author}"
+        cooldown_hours = int(get_env("AI_COOLDOWN_HOURS", required=False) or 168)
 
         try:
-            if self.redis_mgr.exists(key):
+            # Use SETNX (set-if-not-exists) for atomic check-and-set.
+            # This prevents race conditions: only the FIRST call succeeds.
+            # If setnx returns True -> this is the user's first AI post in the window.
+            # If setnx returns False -> the key already existed (user posted before).
+            was_set = self.redis_mgr.setnx(key, datetime.now(timezone.utc).isoformat())
+
+            if was_set:
+                # First AI post this week -- set the TTL and welcome the user
+                self.redis_mgr.expire(key, cooldown_hours * 3600)
+
+                reason = (
+                    f"Hi u/{author}, welcome! This is your first AI image post this week. "
+                    f"Please remember you cannot post another AI image until the "
+                    f"{cooldown_hours // 24} day cooldown period.\n\n"
+                    f"*I am a bot and this action was performed automatically.*"
+                )
+
+                comment = submission.reply(reason)
+                comment.mod.distinguish(sticky=True)
+                logger.info(f"Posted welcome comment for {author}'s first AI post")
+                return True
+            else:
+                # User already has a key -> they posted before within the window -> remove
                 reason = (
                     f"Hi u/{author}, your post has been removed because you exceeded "
                     f"the AI image post limit (1 per week).\n\n"
@@ -213,39 +298,23 @@ class RedditBot:
                 self.stats["posts_removed"] += 1
                 logger.info(f"Removed AI post from {author} - exceeded weekly limit")
                 return True
-            else:
-                cooldown_hours = int(
-                    get_env("AI_COOLDOWN_HOURS", required=False) or 168
-                )
-                self.redis_mgr.setex(
-                    key, cooldown_hours * 3600, datetime.now(timezone.utc).isoformat()
-                )
-
-                reason = (
-                    f"Hi u/{author}, welcome! This is your first AI image post this week. "
-                    f"Please remember you cannot post another AI image until the {cooldown_hours // 24} day cooldown period.\n\n"
-                    f"*I am a bot and this action was performed automatically.*"
-                )
-
-                comment = submission.reply(reason)
-                comment.mod.distinguish(sticky=True)
-                logger.info(f"Posted welcome comment for {author}'s first AI post")
-                return True
 
         except Exception as e:
             logger.error(f"Error processing AI post: {e}")
             return False
 
-    def is_banned_user(self, author) -> bool:
-        """Check if user is banned from the subreddit."""
-        try:
-            key = f"banned:{author}"
-            return self.redis_mgr.exists(key)
-        except Exception:
-            return False
-
     def process_submission(self, submission):
         try:
+            # --- Guard 1: Skip old posts ---
+            if self._is_submission_too_old(submission):
+                self.stats["skipped_old"] += 1
+                return
+
+            # --- Guard 2: Skip already-processed posts ---
+            if self._is_already_processed(submission):
+                self.stats["skipped_duplicate"] += 1
+                return
+
             is_image = any(
                 submission.url.lower().endswith(ext)
                 for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
@@ -263,6 +332,9 @@ class RedditBot:
             if is_image:
                 self.stats["images_processed"] += 1
 
+            # Mark submission as processed AFTER successful handling
+            self._mark_processed(submission)
+
         except Exception as e:
             logger.error(f"Error processing submission {submission.id}: {e}")
             self.stats["errors"] += 1
@@ -272,7 +344,6 @@ class RedditBot:
 
         while self._running:
             try:
-                # Process submissions
                 for submission in self.subreddit.stream.submissions(skip_existing=True):
                     if not self._running:
                         break
@@ -291,15 +362,32 @@ class RedditBot:
 
 app = Flask(__name__)
 bot: Optional[RedditBot] = None
+_bot_lock = Lock()
 
-# Initialize bot on module load (for Gunicorn)
-try:
-    bot = RedditBot()
-    logger.info("Bot initialized successfully")
-    bot_thread = Thread(target=bot.run, daemon=True)
-    bot_thread.start()
-except Exception as e:
-    logger.error(f"Failed to initialize bot: {e}")
+
+def _start_bot():
+    """Initialize and start the bot. Called once; gunicorn preload ensures
+    this only runs in the master process when using --preload, or we limit
+    to 1 worker to avoid duplicates."""
+    global bot
+    with _bot_lock:
+        if bot is not None:
+            return
+        try:
+            bot = RedditBot()
+            logger.info("Bot initialized successfully")
+            bot_thread = Thread(target=bot.run, daemon=True)
+            bot_thread.start()
+        except SystemExit:
+            logger.error("Bot initialization aborted (SystemExit)")
+        except Exception as e:
+            logger.error(f"Failed to initialize bot: {e}")
+
+
+# Initialize bot on module load (for Gunicorn with 1 worker)
+# Skip auto-start during testing
+if os.environ.get("TESTING") != "true":
+    _start_bot()
 
 
 @app.route("/")
@@ -333,16 +421,17 @@ def stats():
     return jsonify({"error": "Bot not initialized"})
 
 
-@app.route("/reload")
+@app.route("/reload", methods=["POST"])
 def reload():
     global bot
     try:
-        if bot:
-            bot.stop()
-        time.sleep(2)
-        bot = RedditBot()
-        bot_thread = Thread(target=bot.run, daemon=True)
-        bot_thread.start()
+        with _bot_lock:
+            if bot:
+                bot.stop()
+            time.sleep(2)
+            bot = RedditBot()
+            bot_thread = Thread(target=bot.run, daemon=True)
+            bot_thread.start()
         return jsonify({"status": "reloaded"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -351,11 +440,11 @@ def reload():
 def main():
     global bot
     try:
-        bot = RedditBot()
-        logger.info("Bot initialized successfully")
-
-        bot_thread = Thread(target=bot.run, daemon=True)
-        bot_thread.start()
+        if bot is None:
+            bot = RedditBot()
+            logger.info("Bot initialized successfully")
+            bot_thread = Thread(target=bot.run, daemon=True)
+            bot_thread.start()
 
         port = int(os.environ.get("PORT", 8080))
         app.run(host="0.0.0.0", port=port, threaded=True)

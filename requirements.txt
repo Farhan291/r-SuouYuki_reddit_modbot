@@ -4,7 +4,6 @@ requests
 gunicorn
 redis
 python-dotenv
-pymongo
 pytest
 pytest-mock
 pytest-cov
