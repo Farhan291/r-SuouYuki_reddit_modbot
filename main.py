@@ -26,7 +26,7 @@ load_dotenv()
 # acting on year-old posts that PRAW may return after a stream reconnect.
 MAX_SUBMISSION_AGE_SECONDS = int(
     os.environ.get("MAX_SUBMISSION_AGE_SECONDS", "600")
-)  # 10 minutes
+)  # default 10 minutes
 
 
 class RedisManager:
@@ -69,7 +69,8 @@ class RedisManager:
             if self.connect():
                 return True
             logger.warning(
-                f"Redis reconnection attempt {attempt + 1}/{self.max_retries} failed, retrying in {self.retry_delay}s..."
+                f"Redis reconnection attempt {attempt + 1}/{self.max_retries} failed, "
+                f"retrying in {self.retry_delay}s..."
             )
             time.sleep(self.retry_delay)
 
@@ -184,22 +185,21 @@ class RedditBot:
             return False
         except Exception as e:
             logger.error(f"Error checking submission age: {e}")
-            # If we can't determine age, process it to be safe
             return False
 
-    def _is_already_processed(self, submission) -> bool:
-        """Check if this submission was already processed using a Redis set.
-        Prevents duplicate processing when the stream serves the same post
-        multiple times (e.g. after reconnects)."""
-        key = "processed_submissions"
-        if self.redis_mgr.sismember(key, submission.id):
-            logger.debug(f"Skipping already-processed submission {submission.id}")
+    def _claim_submission(self, submission) -> bool:
+        """Atomically claim a submission for processing using Redis SETNX.
+        Returns True if THIS bot instance claimed it (first to call).
+        Returns False if another instance already claimed it.
+        This is the ONLY dedup mechanism -- it works across processes."""
+        key = f"processed:{submission.id}"
+        was_set = self.redis_mgr.setnx(key, datetime.now(timezone.utc).isoformat())
+        if was_set:
+            # Auto-expire after 24 hours to avoid unbounded growth
+            self.redis_mgr.expire(key, 86400)
             return True
+        logger.info(f"Submission {submission.id} already claimed, skipping")
         return False
-
-    def _mark_processed(self, submission):
-        """Mark a submission as processed in Redis."""
-        self.redis_mgr.sadd("processed_submissions", submission.id)
 
     def search_source(self, url: str) -> Optional[str]:
         try:
@@ -258,9 +258,8 @@ class RedditBot:
 
         try:
             # Use SETNX (set-if-not-exists) for atomic check-and-set.
-            # This prevents race conditions: only the FIRST call succeeds.
-            # If setnx returns True -> this is the user's first AI post in the window.
-            # If setnx returns False -> the key already existed (user posted before).
+            # If setnx returns True  -> first AI post in the cooldown window -> allow
+            # If setnx returns False -> key exists, user already posted -> remove
             was_set = self.redis_mgr.setnx(key, datetime.now(timezone.utc).isoformat())
 
             if was_set:
@@ -268,9 +267,9 @@ class RedditBot:
                 self.redis_mgr.expire(key, cooldown_hours * 3600)
 
                 reason = (
-                    f"Hi u/{author}, welcome! This is your first AI image post this week. "
-                    f"Please remember you cannot post another AI image until the "
-                    f"{cooldown_hours // 24} day cooldown period.\n\n"
+                    f"Hi u/{author}, welcome! This is your first AI image post "
+                    f"this week. Please remember you cannot post another AI image "
+                    f"until the {cooldown_hours // 24} day cooldown period.\n\n"
                     f"*I am a bot and this action was performed automatically.*"
                 )
 
@@ -279,11 +278,12 @@ class RedditBot:
                 logger.info(f"Posted welcome comment for {author}'s first AI post")
                 return True
             else:
-                # User already has a key -> they posted before within the window -> remove
+                # User already posted within the cooldown window -> remove
                 reason = (
-                    f"Hi u/{author}, your post has been removed because you exceeded "
-                    f"the AI image post limit (1 per week).\n\n"
-                    f"Please wait for the cooldown of one week before posting another AI image.\n\n"
+                    f"Hi u/{author}, your post has been removed because you "
+                    f"exceeded the AI image post limit (1 per week).\n\n"
+                    f"Please wait for the cooldown of one week before posting "
+                    f"another AI image.\n\n"
                     f"Contact moderators if you think this was an error.\n\n"
                     f"*I am a bot and this action was performed automatically.*"
                 )
@@ -310,8 +310,9 @@ class RedditBot:
                 self.stats["skipped_old"] += 1
                 return
 
-            # --- Guard 2: Skip already-processed posts ---
-            if self._is_already_processed(submission):
+            # --- Guard 2: Atomically claim this submission via Redis SETNX ---
+            # If another process/worker already claimed it, skip.
+            if not self._claim_submission(submission):
                 self.stats["skipped_duplicate"] += 1
                 return
 
@@ -331,9 +332,6 @@ class RedditBot:
 
             if is_image:
                 self.stats["images_processed"] += 1
-
-            # Mark submission as processed AFTER successful handling
-            self._mark_processed(submission)
 
         except Exception as e:
             logger.error(f"Error processing submission {submission.id}: {e}")
@@ -360,34 +358,23 @@ class RedditBot:
         logger.info("Bot stopped gracefully")
 
 
+# ---------------------------------------------------------------------------
+# Flask app (health/stats only -- does NOT start the bot)
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
-bot: Optional[RedditBot] = None
-_bot_lock = Lock()
+
+# Shared Redis connection for health checks (connects lazily)
+_health_redis: Optional[RedisManager] = None
 
 
-def _start_bot():
-    """Initialize and start the bot. Called once; gunicorn preload ensures
-    this only runs in the master process when using --preload, or we limit
-    to 1 worker to avoid duplicates."""
-    global bot
-    with _bot_lock:
-        if bot is not None:
-            return
-        try:
-            bot = RedditBot()
-            logger.info("Bot initialized successfully")
-            bot_thread = Thread(target=bot.run, daemon=True)
-            bot_thread.start()
-        except SystemExit:
-            logger.error("Bot initialization aborted (SystemExit)")
-        except Exception as e:
-            logger.error(f"Failed to initialize bot: {e}")
-
-
-# Initialize bot on module load (for Gunicorn with 1 worker)
-# Skip auto-start during testing
-if os.environ.get("TESTING") != "true":
-    _start_bot()
+def _get_health_redis() -> Optional[RedisManager]:
+    global _health_redis
+    if _health_redis is None:
+        redis_url = os.environ.get("REDIS_URL", "")
+        if redis_url:
+            _health_redis = RedisManager(redis_url)
+            _health_redis.connect()
+    return _health_redis
 
 
 @app.route("/")
@@ -399,9 +386,12 @@ def home():
 def health():
     redis_status = "connected"
     try:
-        client = bot.redis_mgr.get_client() if bot and bot.redis_mgr else None
+        mgr = _get_health_redis()
+        client = mgr.get_client() if mgr else None
         if client:
             client.ping()
+        else:
+            redis_status = "disconnected"
     except Exception:
         redis_status = "disconnected"
 
@@ -409,50 +399,39 @@ def health():
         {
             "status": "healthy" if redis_status == "connected" else "degraded",
             "redis": redis_status,
-            "stats": bot.stats if bot else {},
         }
     )
 
 
 @app.route("/stats")
 def stats():
-    if bot:
-        return jsonify(bot.stats)
-    return jsonify({"error": "Bot not initialized"})
+    return jsonify({"info": "Stats available via bot process logs"})
 
 
-@app.route("/reload", methods=["POST"])
-def reload():
-    global bot
-    try:
-        with _bot_lock:
-            if bot:
-                bot.stop()
-            time.sleep(2)
-            bot = RedditBot()
-            bot_thread = Thread(target=bot.run, daemon=True)
-            bot_thread.start()
-        return jsonify({"status": "reloaded"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+# ---------------------------------------------------------------------------
+# CLI entry point: runs the bot directly (no gunicorn, no Flask)
+# ---------------------------------------------------------------------------
 def main():
-    global bot
     try:
-        if bot is None:
-            bot = RedditBot()
-            logger.info("Bot initialized successfully")
-            bot_thread = Thread(target=bot.run, daemon=True)
-            bot_thread.start()
+        bot = RedditBot()
+        logger.info("Bot initialized successfully")
 
+        # Start Flask health server in a background thread
         port = int(os.environ.get("PORT", 8080))
-        app.run(host="0.0.0.0", port=port, threaded=True)
+        flask_thread = Thread(
+            target=lambda: app.run(
+                host="0.0.0.0", port=port, threaded=True, use_reloader=False
+            ),
+            daemon=True,
+        )
+        flask_thread.start()
+        logger.info(f"Health server listening on port {port}")
+
+        # Run the bot in the main thread (blocking)
+        bot.run()
 
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
-        if bot:
-            bot.stop()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)

@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import Mock, patch, MagicMock, PropertyMock
+from unittest.mock import Mock, patch, PropertyMock
 import os
 import sys
 import time
@@ -305,34 +305,26 @@ class TestRedditBot:
         # On error, should return False (process to be safe)
         assert bot._is_submission_too_old(submission) is False
 
-    # ---- Duplicate processing checks ----
+    # ---- Claim submission (dedup via Redis SETNX) ----
 
-    def test_is_already_processed_true(self):
+    def test_claim_submission_succeeds_first_time(self):
         bot = self._make_bot()
-        bot.redis_mgr.sismember.return_value = True
+        bot.redis_mgr.setnx.return_value = True
+        bot.redis_mgr.expire.return_value = True
         submission = Mock()
         submission.id = "abc123"
 
-        assert bot._is_already_processed(submission) is True
-        bot.redis_mgr.sismember.assert_called_once_with(
-            "processed_submissions", "abc123"
-        )
+        assert bot._claim_submission(submission) is True
+        bot.redis_mgr.setnx.assert_called_once()
+        bot.redis_mgr.expire.assert_called_once()
 
-    def test_is_already_processed_false(self):
+    def test_claim_submission_fails_if_already_claimed(self):
         bot = self._make_bot()
-        bot.redis_mgr.sismember.return_value = False
+        bot.redis_mgr.setnx.return_value = False  # Already claimed
         submission = Mock()
         submission.id = "abc123"
 
-        assert bot._is_already_processed(submission) is False
-
-    def test_mark_processed(self):
-        bot = self._make_bot()
-        submission = Mock()
-        submission.id = "abc123"
-
-        bot._mark_processed(submission)
-        bot.redis_mgr.sadd.assert_called_once_with("processed_submissions", "abc123")
+        assert bot._claim_submission(submission) is False
 
     # ---- AI post rate limiting ----
 
@@ -400,16 +392,16 @@ class TestRedditBot:
         bot.process_submission(submission)
 
         assert bot.stats["skipped_old"] == 1
-        # Should not check duplicate or process
-        bot.redis_mgr.sismember.assert_not_called()
+        # Should not try to claim or process
+        bot.redis_mgr.setnx.assert_not_called()
 
-    def test_process_submission_skips_duplicate(self):
-        """Already-processed posts should be skipped."""
+    def test_process_submission_skips_already_claimed(self):
+        """Posts already claimed by another process should be skipped."""
         bot = self._make_bot()
         submission = Mock()
         submission.id = "dup123"
         submission.created_utc = time.time() - 5  # Fresh post
-        bot.redis_mgr.sismember.return_value = True  # Already processed
+        bot.redis_mgr.setnx.return_value = False  # Already claimed
 
         bot.process_submission(submission)
 
@@ -419,8 +411,9 @@ class TestRedditBot:
     def test_process_submission_fresh_ai_post(self, mock_sleep):
         """A fresh AI-flaired post from a new user should be allowed."""
         bot = self._make_bot()
-        bot.redis_mgr.sismember.return_value = False  # Not processed yet
-        bot.redis_mgr.setnx.return_value = True  # First AI post
+        # _claim_submission: setnx returns True (first call for processed:ID)
+        # process_ai_post: setnx returns True (first call for ai_post:author)
+        bot.redis_mgr.setnx.return_value = True
         bot.redis_mgr.expire.return_value = True
 
         submission = Mock()
@@ -437,12 +430,12 @@ class TestRedditBot:
         assert bot.stats["ai_posts_processed"] == 1
         assert bot.stats["images_processed"] == 1
         assert bot.stats["posts_removed"] == 0
-        bot.redis_mgr.sadd.assert_called_once_with("processed_submissions", "fresh123")
 
     def test_process_submission_non_image_non_ai(self):
-        """A text post with no AI flair should be processed but nothing happens."""
+        """A text post with no AI flair should pass through with no action."""
         bot = self._make_bot()
-        bot.redis_mgr.sismember.return_value = False
+        bot.redis_mgr.setnx.return_value = True  # claim succeeds
+        bot.redis_mgr.expire.return_value = True
 
         submission = Mock()
         submission.id = "text123"
@@ -454,16 +447,16 @@ class TestRedditBot:
 
         assert bot.stats["images_processed"] == 0
         assert bot.stats["ai_posts_processed"] == 0
-        bot.redis_mgr.sadd.assert_called_once_with("processed_submissions", "text123")
 
     def test_process_submission_error_handling(self):
         """Errors in process_submission should be caught and counted."""
         bot = self._make_bot()
         submission = Mock()
         submission.id = "err123"
-        # Make created_utc work but then crash on url access
+        # Age check passes but then url access crashes
         submission.created_utc = time.time() - 5
-        bot.redis_mgr.sismember.return_value = False
+        bot.redis_mgr.setnx.return_value = True  # claim succeeds
+        bot.redis_mgr.expire.return_value = True
         type(submission).url = PropertyMock(side_effect=Exception("boom"))
 
         bot.process_submission(submission)
@@ -484,21 +477,14 @@ class TestFlaskApp:
 
         with app.test_client() as client:
             response = client.get("/health")
-            assert response.status_code in [200, 500]
+            assert response.status_code == 200
 
     def test_stats_route(self):
         from main import app
 
         with app.test_client() as client:
             response = client.get("/stats")
-            assert response.status_code in [200]
-
-    def test_reload_requires_post(self):
-        from main import app
-
-        with app.test_client() as client:
-            response = client.get("/reload")
-            assert response.status_code == 405  # Method Not Allowed
+            assert response.status_code == 200
 
 
 if __name__ == "__main__":

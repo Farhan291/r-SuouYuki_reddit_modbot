@@ -21,8 +21,8 @@ RUN pip install --no-cache-dir uv && \
 # Copy application code
 COPY . .
 
-# Expose port (default Flask port)
+# Expose port for health check endpoint
 EXPOSE 8080
 
-# Use gunicorn to serve the Flask app
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "1", "--timeout", "120", "main:app"]
+# Run the bot directly as a single process (NOT gunicorn)
+CMD ["python", "main.py"]

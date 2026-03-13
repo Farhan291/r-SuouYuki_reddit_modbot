@@ -1,7 +1,6 @@
 praw
 flask
 requests
-gunicorn
 redis
 python-dotenv
 pytest
